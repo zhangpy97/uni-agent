@@ -13,9 +13,8 @@ import pytest
 from tests.uni_agent.support import FakeTokenizer, SequencedBackend, fake_vision_info_extractor
 from uni_agent.gateway.config import GatewayActorConfig
 from uni_agent.gateway.session import MessageCodec
-from uni_agent.gateway.session.chain_trajectory_manager import ChainTrajectoryManager
 from uni_agent.gateway.session.session import GatewaySession
-from uni_agent.gateway.session.tree_trajectory_manager import MessageNode, TreeTrajectoryManager
+from uni_agent.gateway.session.tree_session import MessageNode, TreeGatewaySession, TreeTrajectoryManager
 from uni_agent.gateway.session.types import SessionHandle, Trajectory, UnsupportedMediaError
 from verl.utils.tokenizer.continuous_token import MergeResult
 
@@ -199,10 +198,9 @@ async def test_missing_backend_logprobs_still_fail_for_empty_output():
 @pytest.mark.asyncio
 @pytest.mark.parametrize("terminal_action,write_fails", [("finalize", False), ("abort", True)])
 async def test_cancelled_terminal_write_finishes_before_session_retry(tmp_path, terminal_action, write_fails):
-    session = GatewaySession(
+    session = TreeGatewaySession(
         SessionHandle("cancelled-write"),
         FakeContinuousCodec(),
-        use_tree_trajectory_manager=True,
         metadata={"_log_dir": str(tmp_path)},
     )
     request = {"messages": [{"role": "user", "content": "task"}], "tools": None, "sampling_params": {}}
@@ -506,8 +504,7 @@ async def test_chain_registry_uses_contiguous_ids_and_tracks_committed_leaves(ou
         {"role": "user", "content": "branch one"},
         {"role": "assistant", "content": "edited" if rewrite else "B"},
     ]
-    if not rewrite:
-        messages.append({"role": "user", "content": "continue"})
+    messages.append({"role": "user", "content": "continue"})
     new_routing = None if rewrite else [[4]]
     backend = Backend("D", routed_experts=new_routing)
     result = await generate(
@@ -685,9 +682,13 @@ async def test_session_selects_manager_and_captures_linear_token_truth(tmp_path)
         await actor.create_session("mode-selection", metadata={"_log_dir": str(tmp_path)})
         session = actor._sessions["mode-selection"]
         session._codec.extract_multi_modal_data = AsyncMock(side_effect=[media, (None, None)])
-        assert isinstance(session._manager, TreeTrajectoryManager if use_tree else ChainTrajectoryManager)
         if use_tree:
+            assert isinstance(session, TreeGatewaySession)
+            manager = session._manager
             assert session._manager.storage_path == tmp_path / "trajectory_tree.pkl"
+        else:
+            assert isinstance(session, GatewaySession)
+            manager = None
         backend = actor._backend
         messages = [{"role": "user", "content": "task"}]
         for _ in range(2):
@@ -697,12 +698,18 @@ async def test_session_selects_manager_and_captures_linear_token_truth(tmp_path)
             )
             messages = [*messages, result.assistant_msg, {"role": "user", "content": "continue"}]
 
-        manager = session._manager
-        async with manager._tree_lock if use_tree else manager.request_lock:
-            [active_chain] = session.get_active_chains()
-            assert active_chain["message_history"] == messages[:-1]
+        if use_tree:
+            async with manager._tree_lock:
+                [active_chain] = session.get_active_chains()
+                assert active_chain["message_history"] == messages[:-1]
+        else:
+            assert len(session.active_chains) == 1
+            assert session.active_chains[0].message_history == messages[:-1]
         [trajectory] = await session.finalize()
-        assert session.get_active_chains() == []
+        if use_tree:
+            assert session.get_active_chains() == []
+        else:
+            assert session.active_chains == []
         trajectories.append(trajectory)
         assert trajectory.prompt_ids + trajectory.response_ids == backend.calls[1]["prompt_ids"] + [ord("B")]
         assert sum(trajectory.response_mask) == 2
@@ -726,10 +733,9 @@ async def test_session_selects_manager_and_captures_linear_token_truth(tmp_path)
 )
 async def test_tree_persistence_follows_session_log_directory(tmp_path, terminal_action, has_log_dir, write_fails):
     log_dir = tmp_path / "step_12" / "tree-persistence"
-    session = GatewaySession(
+    session = TreeGatewaySession(
         SessionHandle("tree-persistence"),
         MessageCodec(FakeTokenizer()),
-        use_tree_trajectory_manager=True,
         metadata={"_log_dir": str(log_dir) if has_log_dir else None},
     )
     await session.run_generation(
@@ -741,7 +747,11 @@ async def test_tree_persistence_follows_session_log_directory(tmp_path, terminal
         manager,
         session._codec,
         Backend("UNUSED"),
-        [{"role": "user", "content": "task"}, {"role": "assistant", "content": "A"}],
+        [
+            {"role": "user", "content": "task"},
+            {"role": "assistant", "content": "A"},
+            {"role": "user", "content": "continue"},
+        ],
         trajectory_capacity=1,
     )
     assert isinstance(manager.chains[1], Trajectory)

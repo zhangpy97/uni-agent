@@ -13,8 +13,18 @@ from itertools import repeat
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
+from fastapi import HTTPException
+
 from uni_agent.gateway.session.codec import MessageCodec
-from uni_agent.gateway.session.types import AgentContext, Trajectory, UnsupportedMediaError
+from uni_agent.gateway.session.session import GatewaySession, GenerationOutcome, SessionPhase
+from uni_agent.gateway.session.types import (
+    AgentContext,
+    InternalGenerationRequest,
+    SessionHandle,
+    Trajectory,
+    UnsupportedMediaError,
+)
+from uni_agent.rl_insight.adapter import start_generation_span
 
 logger = logging.getLogger(__name__)
 _TRAJECTORY_CAPACITY_HINT = (
@@ -85,6 +95,15 @@ class _MountedGeneration:
     target_node: MessageNode
     merge_backup: MessageNode | None
     rewrite_action: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _TreeActiveChainView:
+    """Compatibility view matching the fields used by linear-session callers."""
+
+    chain_id: int
+    message_history: list[dict[str, Any]]
+    active_tool_schemas: list[dict[str, Any]] | None
 
 
 class TreeTrajectoryManager:
@@ -465,7 +484,7 @@ class TreeTrajectoryManager:
                 rank = (len(history) if exact else prefix_length, exact)
                 for node in path:
                     active_path_ranks[id(node)] = max(active_path_ranks.get(id(node), (0, False)), rank)
-            while offset < len(messages):
+            while offset < len(messages) and messages[-1].get("role") != "assistant":
                 incoming = messages[offset:]
                 matching_full: list[MessageNode] = []
                 candidate: MessageNode | None = None
@@ -916,3 +935,184 @@ class TreeTrajectoryManager:
 
     def _copy_tools(self, tools: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
         return [dict(tool) for tool in tools] if tools is not None else None
+
+
+class TreeGatewaySession(GatewaySession):
+    """Gateway session backed by the shared-prefix trajectory tree."""
+
+    def __init__(
+        self,
+        handle: SessionHandle,
+        codec: MessageCodec,
+        *,
+        prompt_length: int | None = None,
+        response_length: int | None = None,
+        sampling_params: dict[str, Any] | None = None,
+        enable_last_assistant_rollback: bool = True,
+        coalesce_reserved_exact_requests: bool = True,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(
+            handle=handle,
+            codec=codec,
+            prompt_length=prompt_length,
+            response_length=response_length,
+            sampling_params=sampling_params,
+            enable_last_assistant_rollback=enable_last_assistant_rollback,
+            coalesce_reserved_exact_requests=coalesce_reserved_exact_requests,
+            metadata=metadata,
+        )
+        self._manager = TreeTrajectoryManager(
+            coalesce_reserved_exact_requests=coalesce_reserved_exact_requests,
+            enable_last_assistant_rollback=enable_last_assistant_rollback,
+            session_id=handle.session_id,
+            log_dir=self._metadata.get("_log_dir"),
+            mm_processor_kwargs=codec.mm_processor_kwargs,
+        )
+
+    async def run_generation(self, request: InternalGenerationRequest, backend) -> GenerationOutcome:
+        """Run one generation while allowing backend overlap within the session."""
+        agent_context = request.get("agent_context")
+        agent_context = agent_context.copy() if agent_context is not None else None
+        generation_span = start_generation_span(self._trace_identity)
+        try:
+            async with self.request_lock:
+                self._require_active()
+
+            async def generate_fn(context_ids, sampling_params, image_data, video_data):
+                try:
+                    backend_kwargs = {}
+                    if agent_context is not None and getattr(backend, "supports_agent_context", False) is True:
+                        backend_kwargs["agent_context"] = agent_context.copy()
+                    return await backend.generate(
+                        request_id=self.handle.session_id,
+                        prompt_ids=context_ids,
+                        sampling_params=sampling_params,
+                        image_data=image_data,
+                        video_data=video_data,
+                        mm_processor_kwargs=self._codec.mm_processor_kwargs or {},
+                        **backend_kwargs,
+                    )
+                except ValueError as exc:
+                    raise HTTPException(status_code=400, detail=str(exc)) from exc
+                except Exception as exc:
+                    raise HTTPException(status_code=500, detail=f"{exc.__class__.__name__}: {exc}") from exc
+
+            try:
+                (
+                    assistant_msg,
+                    finish_reason,
+                    prompt_tokens,
+                    completion_tokens,
+                    chain_id,
+                    turn,
+                    capacity_exhausted,
+                ) = await self._manager.run_generation(
+                    messages=request["messages"],
+                    tools=request["tools"],
+                    codec=self._codec,
+                    trajectory_capacity=self._trajectory_capacity,
+                    sampling_params=dict(request["sampling_params"]),
+                    generate_fn=generate_fn,
+                    agent_context=agent_context,
+                )
+            except RuntimeError as exc:
+                async with self.request_lock:
+                    if self.phase != SessionPhase.ACTIVE and str(exc) in (
+                        "trajectory tree is finalized or aborted",
+                        "generation branch was removed before Backend completion",
+                    ):
+                        raise HTTPException(
+                            status_code=409,
+                            detail=f"Session {self.handle.session_id} is {self.phase.value.lower()}",
+                        ) from exc
+                raise
+            outcome = GenerationOutcome(
+                assistant_msg=assistant_msg,
+                finish_reason=finish_reason,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+            )
+            self._touch()
+            if capacity_exhausted:
+                generation_span.capacity_exhausted(prompt_tokens=prompt_tokens, chain_id=chain_id)
+            else:
+                generation_span.success(
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    chain_id=chain_id,
+                    turn=turn,
+                    assistant_msg=assistant_msg,
+                    finish_reason=finish_reason,
+                )
+            return outcome
+        except BaseException as exc:
+            generation_span.failure(exc)
+            raise
+        finally:
+            generation_span.report()
+
+    async def finalize(self) -> list[Trajectory]:
+        async with self.request_lock:
+            if self.phase == SessionPhase.ABORTED:
+                raise RuntimeError(f"Session {self.handle.session_id} is aborted")
+            if self.phase == SessionPhase.FINALIZED:
+                raise RuntimeError(f"Session {self.handle.session_id} is finalized")
+            trajectories = await self._manager.finalize_trajectories()
+            self.phase = SessionPhase.FINALIZED
+            manager_state = self._manager.snapshot_state()
+            if manager_state["num_coalesced_requests"] or manager_state["rollback_count"]:
+                logger.info(
+                    "Session finalized with session=%s trajectories=%s num_coalesced_requests=%s "
+                    "rollback_count=%s rollback_dropped_trainable_tokens_total=%s",
+                    self.handle.session_id,
+                    len(trajectories),
+                    manager_state["num_coalesced_requests"],
+                    manager_state["rollback_count"],
+                    manager_state["rollback_dropped_trainable_tokens_total"],
+                )
+            self._touch()
+            return trajectories
+
+    async def abort(self) -> None:
+        async with self.request_lock:
+            if self.phase == SessionPhase.ABORTED:
+                return
+            if self.phase == SessionPhase.FINALIZED:
+                raise RuntimeError(f"Session {self.handle.session_id} is finalized")
+            await self._manager.abort()
+            self.phase = SessionPhase.ABORTED
+            self._touch()
+
+    def snapshot_state(self) -> dict[str, Any]:
+        manager_state = self._manager.snapshot_state()
+        return {
+            "session_id": self.handle.session_id,
+            "phase": self.phase.value,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            **manager_state,
+        }
+
+    def get_active_chains(self) -> list[dict[str, Any]]:
+        return self._manager.get_active_chains()
+
+    @property
+    def active_chains(self) -> list[_TreeActiveChainView]:
+        """Expose the tree leaves through the linear session's attribute API."""
+        if not hasattr(self, "_manager"):
+            return []
+        return [_TreeActiveChainView(**chain) for chain in self._manager.get_active_chains()]
+
+    @active_chains.setter
+    def active_chains(self, value: list[Any]) -> None:
+        # ``GatewaySession.__init__`` initializes this legacy attribute before
+        # the tree manager exists. The tree implementation owns the live view.
+        del value
+
+    def _require_active(self) -> None:
+        if self.phase != SessionPhase.ACTIVE:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Session {self.handle.session_id} is {self.phase.value.lower()}",
+            )

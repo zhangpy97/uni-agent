@@ -66,7 +66,6 @@ def _session(
         sampling_params=sampling_params,
         enable_last_assistant_rollback=enable_last_assistant_rollback,
         coalesce_reserved_exact_requests=coalesce_reserved_exact_requests,
-        use_tree_trajectory_manager=False,
     )
 
 
@@ -96,8 +95,8 @@ def test_gateway_session_enables_rollback_and_coalescing_by_default():
         MessageCodec(FakeTokenizer()),
     )
 
-    assert session._manager._enable_last_assistant_rollback is True
-    assert session._manager._coalesce_reserved_exact_requests is True
+    assert session._enable_last_assistant_rollback is True
+    assert session._coalesce_reserved_exact_requests is True
 
 
 async def _run(session: GatewaySession, backend: SequencedBackend, messages: list[dict], **payload_extra):
@@ -229,8 +228,8 @@ async def _codec_compatible_video_extractor(messages, image_patch_size, config=N
 
 def _assert_active_chain_tip_hashes_match_history(session: GatewaySession) -> None:
     state = session.snapshot_state()
-    for chain in session._manager.active_chains:
-        expected_tip_hash = session._manager._extend_message_prefix_hashes([], chain.message_history)[-1]
+    for chain in session.active_chains:
+        expected_tip_hash = session._extend_message_prefix_hashes([], chain.message_history)[-1]
         assert chain.message_tip_hash == expected_tip_hash
         assert state["active_chain_tip_hashes"][chain.chain_id] == expected_tip_hash
 
@@ -343,7 +342,7 @@ async def test_first_assistant_rewrite_reuses_chain_without_stale_response():
     assert state["active_chain_ids"] == [1]
     assert state["rollback_count"] == 1
     assert state["rollback_dropped_trainable_tokens_total"] == len("FORMAT_ERROR")
-    chain = session._manager.active_chains[0]
+    chain = session.active_chains[0]
     expected_prompt_ids = codec.build_initial_tokens(first_messages)
     del expected_prompt_ids[-len(codec.turn_separator) - len(codec.generation_prompt) :]
     expected_context_ids = codec.build_initial_tokens(rewrite_messages)
@@ -381,7 +380,7 @@ async def test_first_assistant_rollback_failure_preserves_original_chain():
     state = session.snapshot_state()
     assert state["active_chain_ids"] == [1]
     assert state["rollback_count"] == 0
-    assert _decode_response_ids(session._manager.active_chains[0].buffer.response_ids) == "FORMAT_ERROR"
+    assert _decode_response_ids(session.active_chains[0].buffer.response_ids) == "FORMAT_ERROR"
 
 
 @pytest.mark.cpu
@@ -432,8 +431,8 @@ async def test_first_assistant_rewrite_with_assistant_tool_context_reuses_chain(
     await _run(session, backend, first_messages)
     await _run(session, backend, rewrite_messages)
 
-    assert [chain.chain_id for chain in session._manager.active_chains] == [1]
-    chain = session._manager.active_chains[0]
+    assert [chain.chain_id for chain in session.active_chains] == [1]
+    chain = session.active_chains[0]
     codec = session._codec
     assert backend.calls[1]["prompt_ids"] == codec.build_initial_tokens(rewrite_messages)
     assert chain.buffer.response_ids[-len("FIXED") :] == _ids("FIXED")
@@ -462,7 +461,7 @@ async def test_later_assistant_rollback_removes_only_the_response_side_gp():
     await _run(session, backend, second_messages)
     await _run(session, backend, rewrite_messages)
 
-    [chain] = session._manager.active_chains
+    [chain] = session.active_chains
     committed_before_replacement = chain.buffer.prompt_ids + chain.buffer.response_ids[: -len("FIXED")]
     assert backend.calls[2]["prompt_ids"] == committed_before_replacement
     assert _decode_response_ids(chain.buffer.response_ids) == ("A1user:second\nuser:replacement\nassistant:FIXED")
@@ -490,7 +489,7 @@ async def test_later_assistant_rollback_rejects_misaligned_assistant_prefix():
 
     await _run(session, backend, first_messages)
     await _run(session, backend, continuation)
-    [chain] = session._manager.active_chains
+    [chain] = session.active_chains
     snapshot = chain.last_assistant_start
     separator_end = snapshot.response_ids_len - len(codec.generation_prompt)
     chain.buffer.response_ids[separator_end - 1] += 1
@@ -527,7 +526,7 @@ async def test_last_assistant_rollback_splits_when_history_changes_before_bounda
     state = session.snapshot_state()
     assert state["active_chain_ids"] == [1, 2]
     assert state["rollback_count"] == 0
-    chains_by_id = {chain.chain_id: chain for chain in session._manager.active_chains}
+    chains_by_id = {chain.chain_id: chain for chain in session.active_chains}
     assert chains_by_id[1].message_history[2]["content"] == "original tool result"
     assert chains_by_id[2].message_history[2]["content"] == "edited tool result"
     assert _decode_response_ids(chains_by_id[1].buffer.response_ids).endswith("A2")
@@ -559,7 +558,7 @@ async def test_last_assistant_rollback_ambiguous_deepest_boundary_splits_over_sh
     state = session.snapshot_state()
     assert state["active_chain_ids"] == [1, 2, 3, 4]
     assert state["rollback_count"] == 0
-    chains_by_id = {chain.chain_id: chain for chain in session._manager.active_chains}
+    chains_by_id = {chain.chain_id: chain for chain in session.active_chains}
     assert _decode_response_ids(chains_by_id[1].buffer.response_ids) == "A1"
     assert _decode_response_ids(chains_by_id[4].buffer.response_ids) == "FIXED"
 
@@ -586,7 +585,7 @@ async def test_last_assistant_rollback_ignores_shallower_candidate_for_unique_de
     state = session.snapshot_state()
     assert state["active_chain_ids"] == [1, 2]
     assert state["rollback_count"] == 1
-    chains_by_id = {chain.chain_id: chain for chain in session._manager.active_chains}
+    chains_by_id = {chain.chain_id: chain for chain in session.active_chains}
     assert _decode_response_ids(chains_by_id[1].buffer.response_ids) == "SHALLOW"
     deep_text = _decode_response_ids(chains_by_id[2].buffer.response_ids)
     assert deep_text.startswith("A1")
@@ -607,13 +606,13 @@ async def test_last_assistant_rollback_excludes_reserved_candidate():
     ]
 
     await _run(session, SequencedBackend(["BAD"]), prompt)
-    session._manager.reserved_chain_ids.add(1)
+    session.reserved_chain_ids.add(1)
     await _run(session, SequencedBackend(["FIXED"]), rewrite_messages)
 
     state = session.snapshot_state()
     assert state["active_chain_ids"] == [1, 2]
     assert state["rollback_count"] == 0
-    chains_by_id = {chain.chain_id: chain for chain in session._manager.active_chains}
+    chains_by_id = {chain.chain_id: chain for chain in session.active_chains}
     assert _decode_response_ids(chains_by_id[1].buffer.response_ids) == "BAD"
     assert _decode_response_ids(chains_by_id[2].buffer.response_ids) == "FIXED"
 
@@ -643,7 +642,7 @@ async def test_last_assistant_rollback_prefers_longer_service_chain_over_exact_s
     state = session.snapshot_state()
     assert state["active_chain_ids"] == [1, 2]
     assert state["rollback_count"] == 1
-    chains_by_id = {chain.chain_id: chain for chain in session._manager.active_chains}
+    chains_by_id = {chain.chain_id: chain for chain in session.active_chains}
     assert _decode_response_ids(chains_by_id[1].buffer.response_ids) == "A1"
     long_chain_text = _decode_response_ids(chains_by_id[2].buffer.response_ids)
     assert long_chain_text.startswith("A1")
@@ -672,7 +671,7 @@ async def test_last_assistant_rollback_tie_prefers_exact_chain_without_drop():
     state = session.snapshot_state()
     assert state["active_chain_ids"] == [1, 2]
     assert state["rollback_count"] == 0
-    chains_by_id = {chain.chain_id: chain for chain in session._manager.active_chains}
+    chains_by_id = {chain.chain_id: chain for chain in session.active_chains}
     assert _decode_response_ids(chains_by_id[1].buffer.response_ids).endswith("FIXED")
     assert _decode_response_ids(chains_by_id[2].buffer.response_ids).endswith("A2")
 
@@ -682,13 +681,13 @@ async def test_last_assistant_rollback_tie_prefers_exact_chain_without_drop():
 def test_chain_prefix_hash_match_accepts_empty_history_for_any_request():
     """Document the current empty-history wildcard behavior without changing it."""
     session = _session("empty-history-prefix")
-    incoming_hashes = session._manager._extend_message_prefix_hashes(
+    incoming_hashes = session._extend_message_prefix_hashes(
         [],
         [{"role": "user", "content": "any request"}],
     )
     empty_chain = SimpleNamespace(message_history=[], message_tip_hash="unused")
 
-    assert session._manager._is_chain_prefix_hash_match(
+    assert session._is_chain_prefix_hash_match(
         chain=empty_chain,
         incoming_message_prefix_hashes=incoming_hashes,
     )
@@ -711,7 +710,7 @@ async def test_later_assistant_rollback_rejects_misaligned_stored_logprobs():
     backend = _LogprobBackend([("A1", "full"), ("A2", "full"), ("FIXED", "full")])
     await _run(session, backend, prompt)
     await _run(session, backend, continuation)
-    session._manager.active_chains[0].buffer.response_logprobs.pop()
+    session.active_chains[0].buffer.response_logprobs.pop()
 
     with pytest.raises(AssertionError, match="response_logprobs must be empty or aligned"):
         await _run(session, backend, rewrite_messages)
@@ -733,7 +732,7 @@ async def test_last_assistant_rollback_disabled_splits_rewritten_assistant():
     state = session.snapshot_state()
     assert state["active_chain_ids"] == [1, 2]
     assert state["rollback_count"] == 0
-    chains_by_id = {chain.chain_id: chain for chain in session._manager.active_chains}
+    chains_by_id = {chain.chain_id: chain for chain in session.active_chains}
     assert _decode_response_ids(chains_by_id[1].buffer.response_ids) == "BAD"
     assert _decode_response_ids(chains_by_id[2].buffer.response_ids) == "FIXED"
 
@@ -788,7 +787,7 @@ async def test_chain_selection_excludes_positive_assistant_span(assistant_conten
     await _run(session, backend, incoming[:1])
     await _run(session, backend, incoming)
 
-    assert [chain.buffer.response_ids for chain in session._manager.active_chains] == [_ids("OLD"), _ids("NEW")]
+    assert [chain.buffer.response_ids for chain in session.active_chains] == [_ids("OLD"), _ids("NEW")]
 
 
 @pytest.mark.cpu
@@ -815,7 +814,7 @@ async def test_multiple_chains_distinct_sibling_continuation_matches_older_assis
     )
 
     assert before_continuation["active_chain_ids"] == [1, 2]
-    chains_by_id = {chain.chain_id: chain for chain in session._manager.active_chains}
+    chains_by_id = {chain.chain_id: chain for chain in session.active_chains}
     assert chains_by_id[1].message_history[1]["content"] == "OLDER"
     assert chains_by_id[1].message_history[-1]["content"] == "CONT"
     assert chains_by_id[2].message_history == [
@@ -857,7 +856,7 @@ async def test_multiple_chains_reserved_siblings_fall_back_before_starting_new_c
         backend.release_call(index)
     await asyncio.gather(*tasks)
 
-    chains_by_id = {chain.chain_id: chain for chain in session._manager.active_chains}
+    chains_by_id = {chain.chain_id: chain for chain in session.active_chains}
     assert set(chains_by_id) == {1, 2, 3, 4}
     assert _decode_response_ids(chains_by_id[3].buffer.response_ids).endswith("CHAIN3")
     assert _decode_response_ids(chains_by_id[2].buffer.response_ids).endswith("CHAIN2")
@@ -1002,8 +1001,8 @@ async def test_exact_retry_reuses_failure_and_allows_a_later_retry(existing_chai
     results = await asyncio.gather(owner, duplicate, return_exceptions=True)
     assert len(backend.calls) == 1
     assert all(isinstance(result, HTTPException) and result.status_code == 500 for result in results)
-    assert session._manager.reserved_chain_ids == set()
-    assert session._manager._inflight_exact_requests == {}
+    assert session.reserved_chain_ids == set()
+    assert session._inflight_exact_requests == {}
     assert session.snapshot_state()["num_coalesced_requests"] == 1
 
     await _run(session, SequencedBackend(["RECOVERED"]), continuation)
@@ -1041,8 +1040,8 @@ async def test_first_turn_coalescing_cancellation(cancel_owner):
         expected = "FIRST"
 
     assert len(backend.calls) == 1
-    assert session._manager.reserved_chain_ids == set()
-    assert session._manager._inflight_exact_requests == {}
+    assert session.reserved_chain_ids == set()
+    assert session._inflight_exact_requests == {}
     [trajectory] = await session.finalize()
     assert _decode_response_ids(trajectory.response_ids) == expected
     assert session.snapshot_state()["num_coalesced_requests"] == 1
@@ -1462,7 +1461,7 @@ async def test_multiple_chains_returns_length_when_initial_context_fills_total_t
     assert outcome.finish_reason == "length"
     assert outcome.completion_tokens == 0
     assert backend.steps == ["SHOULD_NOT_RUN"]
-    assert session._manager.active_chains == []
+    assert session.active_chains == []
     assert await session.finalize() == []
     assert "Trajectory capacity prevents generation" in caplog.text
     assert "effective_max_tokens=0 completion_tokens=0 backend_called=false" in caplog.text
@@ -1722,7 +1721,7 @@ async def test_multiple_chains_oversized_split_returns_length_without_closing_re
     )
     await _run(session, SequencedBackend(["BASE"]), first_messages)
     pending_backend = _ControlledParallelBackend(["CONT"])
-    pending_messages = list(session._manager.active_chains[0].message_history)
+    pending_messages = list(session.active_chains[0].message_history)
     pending_task = asyncio.create_task(_run(session, pending_backend, pending_messages))
     await pending_backend.wait_for_calls(1)
 
@@ -1857,13 +1856,9 @@ def test_message_prefix_hashes_use_canonical_internal_tool_call_arguments():
             ],
         }
 
-    canonical_a = session._manager._extend_message_prefix_hashes(
-        [], [assistant_tool_call({"query": "weather", "limit": 2})]
-    )
-    canonical_b = session._manager._extend_message_prefix_hashes(
-        [], [assistant_tool_call({"limit": 2, "query": "weather"})]
-    )
-    unnormalized_wire = session._manager._extend_message_prefix_hashes(
+    canonical_a = session._extend_message_prefix_hashes([], [assistant_tool_call({"query": "weather", "limit": 2})])
+    canonical_b = session._extend_message_prefix_hashes([], [assistant_tool_call({"limit": 2, "query": "weather"})])
+    unnormalized_wire = session._extend_message_prefix_hashes(
         [], [assistant_tool_call('{"query":"weather","limit":2}')]
     )
 
@@ -1899,11 +1894,9 @@ def test_message_prefix_hashes_ignore_renamed_and_swapped_tool_call_ids():
             {"role": "tool", "tool_call_id": result_ids[1], "content": "up"},
         ]
 
-    original = session._manager._extend_message_prefix_hashes([], history(("call_a", "call_b"), ("call_a", "call_b")))
-    renamed = session._manager._extend_message_prefix_hashes([], history(("call_x", "call_y"), ("call_x", "call_y")))
-    swapped_results = session._manager._extend_message_prefix_hashes(
-        [], history(("call_x", "call_y"), ("call_y", "call_x"))
-    )
+    original = session._extend_message_prefix_hashes([], history(("call_a", "call_b"), ("call_a", "call_b")))
+    renamed = session._extend_message_prefix_hashes([], history(("call_x", "call_y"), ("call_x", "call_y")))
+    swapped_results = session._extend_message_prefix_hashes([], history(("call_x", "call_y"), ("call_y", "call_x")))
 
     assert original == renamed
     assert original == swapped_results
@@ -2203,7 +2196,7 @@ async def test_multiple_chains_accumulates_incremental_tool_images(initial_image
     expected_images = ["image://a.png"] if initial_image else []
     await _run(session, backend, messages)
     for answer, url in [("FIRST", "image://b.png"), ("SECOND", "image://c.png"), ("THIRD", None)]:
-        previous_buffer = session._manager.active_chains[0].buffer
+        previous_buffer = session.active_chains[0].buffer
         saved_mask = list(previous_buffer.response_mask)
         saved_logprobs = list(previous_buffer.response_logprobs)
         context = _image_message(url, "crop") if url else {"role": "user", "content": "follow up"}
@@ -2213,7 +2206,7 @@ async def test_multiple_chains_accumulates_incremental_tool_images(initial_image
         messages = [*messages, {"role": "assistant", "content": answer}, context]
         await _run(session, backend, messages)
         assert backend.calls[-1]["image_data"] == expected_images
-        buffer = session._manager.active_chains[0].buffer
+        buffer = session.active_chains[0].buffer
         assert buffer.response_mask[: len(saved_mask)] == saved_mask
         assert buffer.response_logprobs[: len(saved_logprobs)] == saved_logprobs
 
@@ -2245,7 +2238,7 @@ async def test_incremental_image_rollback_failure_does_not_change_stored_media()
     rewrite = [*second, {"role": "assistant", "content": "REPLACED"}, _image_message("image://unsent.png", "crop")]
     with pytest.raises(HTTPException, match="failed crop"):
         await _run(session, backend, rewrite)
-    assert session._manager.active_chains[0].image_data == ["image://a.png", "image://b.png"]
+    assert session.active_chains[0].image_data == ["image://a.png", "image://b.png"]
     rewrite[-1] = _image_message("image://c.png", "crop")
     await _run(session, backend, rewrite)
     assert backend.calls[-1]["image_data"] == ["image://a.png", "image://b.png", "image://c.png"]
