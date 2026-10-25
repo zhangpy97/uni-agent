@@ -44,8 +44,9 @@ class GatewayActorConfig:
             requests in the same session share an in-flight result, including
             first-turn and new-chain requests. Enabled by default; disable for
             independent concurrent sampling of identical requests.
-        use_tree_trajectory_manager: Use the shared-prefix tree implementation.
-            Defaults to the baseline linear-chain implementation.
+        use_tree_trajectory_manager: Select TreeGatewaySession for shared-prefix
+            trajectories when true. Defaults to false, using GatewaySession
+            to manage linear chains directly.
     """
 
     tokenizer: Any

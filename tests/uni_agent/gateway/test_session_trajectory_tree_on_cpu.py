@@ -670,7 +670,7 @@ async def test_concurrent_new_chains_allocate_ids_in_commit_order():
 
 
 @pytest.mark.asyncio
-async def test_session_selects_manager_and_captures_linear_token_truth(tmp_path):
+async def test_actor_selects_session_and_captures_linear_token_truth(tmp_path):
     from uni_agent.gateway.gateway import _GatewayActor
 
     media = (["image-a", "image-b"], [("video", {"fps": 24})])

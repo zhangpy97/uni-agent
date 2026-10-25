@@ -1,4 +1,4 @@
-"""Disk-persistable, per-session trajectory tree management."""
+"""Tree gateway session and trajectory management with optional terminal snapshots."""
 
 from __future__ import annotations
 
@@ -37,13 +37,13 @@ _TRAJECTORY_CAPACITY_HINT = (
 
 @dataclass(slots=True)
 class MessageNode:
-    """One Backend generation with any unmatched history needed to reach it.
+    """One backend generation with any unmatched history needed to reach it.
 
     A node starts with the request's unmatched messages and prompt token delta,
     which may include reconstructed history. It becomes completed in place after
     the model output and decoded assistant message arrive. ``chain_id == 0``
     means a new branch is not committed yet; successful commits allocate the
-    next 1-based id, matching the latest Gateway chain semantics.
+    next 1-based chain ID, as in ``GatewaySession``.
     """
 
     node_id: int
@@ -65,7 +65,6 @@ class MessageNode:
     min_global_steps: int | None = None
     max_global_steps: int | None = None
     chain_id: int = 0
-    token_length: int = 0
     message_turn_count: int = 0
     num_coalesced_requests: int = 0
     rollback_count: int = 0
@@ -87,7 +86,7 @@ class InflightRequest:
 
 @dataclass(frozen=True, slots=True)
 class _MountedGeneration:
-    """Request-local tree state kept while its Backend generation is running."""
+    """Request-local tree state kept while its backend generation is running."""
 
     context_ids: list[int]
     image_data: list[Any] | None
@@ -216,8 +215,8 @@ class TreeTrajectoryManager:
             if self._coalesce_reserved_exact_requests
             else None
         )
-        # No await between lookup and registration: retain Session's early
-        # coalescing while keeping node mounting under the existing tree lock.
+        # No await between lookup and registration: identical requests share
+        # ownership before node mounting acquires the tree lock.
         if request_fingerprint is not None:
             joined_request = self._inflight_exact_requests.get(request_fingerprint)
             if joined_request is not None:
@@ -285,7 +284,7 @@ class TreeTrajectoryManager:
         request_fingerprint: str | None,
         agent_context: AgentContext | None = None,
     ) -> tuple[dict[str, Any], str, int, int, int | None, int, bool]:
-        """Run one concurrent tree transaction around an unlocked Backend call."""
+        """Run one concurrent tree transaction around an unlocked backend call."""
         async with self._tree_lock:
             if self.root is None:
                 raise RuntimeError("generation branch was removed before Backend completion")
@@ -379,7 +378,6 @@ class TreeTrajectoryManager:
                 node.response_ids = response_ids
                 node.response_logprobs = response_logprobs
                 parent = node.parent
-                node.token_length = len(merge_result.token_ids)
                 node.message_turn_count = (parent.message_turn_count if parent is not None else 0) + sum(
                     message.get("role") in ("user", "assistant") for message in node.messages
                 )
@@ -734,7 +732,7 @@ class TreeTrajectoryManager:
         return len(trajectory.prompt_ids) + len(trajectory.response_ids)
 
     def snapshot_state(self) -> dict[str, Any]:
-        """Read resident metadata without waiting for locks or loading the tree."""
+        """Read in-memory metadata without waiting for locks or performing I/O."""
         chain_ids = sorted(chain_id for chain_id, leaf in self.chains.items() if isinstance(leaf, MessageNode))
         return {
             "num_trajectories": self._num_trajectories
@@ -746,6 +744,7 @@ class TreeTrajectoryManager:
             "rollback_dropped_trainable_tokens_total": self.rewrite_dropped_trainable_tokens,
             "num_coalesced_requests": self._coalesced_request_count,
             "rewrite_fork_count": self.rewrite_fork_count,
+            # Cumulative node IDs allocated, including failed or removed branches.
             "num_nodes": self._next_node_id - 1,
         }
 
@@ -767,7 +766,7 @@ class TreeTrajectoryManager:
                         exc_info=True,
                     )
             self._num_trajectories = len(trajectories)
-            self._unload_tree()
+            self._clear_tree()
             return trajectories
 
     async def abort(self) -> None:
@@ -785,7 +784,7 @@ class TreeTrajectoryManager:
                     exc_info=True,
                 )
             self._num_trajectories = 0
-            self._unload_tree()
+            self._clear_tree()
 
     def get_active_chains(self) -> list[dict[str, Any]]:
         return [
@@ -798,8 +797,8 @@ class TreeTrajectoryManager:
             if isinstance(leaf, MessageNode)
         ]
 
-    def _unload_tree(self) -> None:
-        """Drop the loaded tree after breaking MessageNode reference cycles."""
+    def _clear_tree(self) -> None:
+        """Release the in-memory tree and break MessageNode reference cycles."""
         stack = [leaf for leaf in self.chains.values() if isinstance(leaf, MessageNode)]
         if self.root is not None:
             stack.append(self.root)
@@ -1106,7 +1105,7 @@ class TreeGatewaySession(GatewaySession):
 
     @active_chains.setter
     def active_chains(self, value: list[Any]) -> None:
-        # ``GatewaySession.__init__`` initializes this legacy attribute before
+        # ``GatewaySession.__init__`` initializes the Chain attribute before
         # the tree manager exists. The tree implementation owns the live view.
         del value
 

@@ -159,7 +159,7 @@ A finalized trajectory contains:
 
 - `prompt_ids`: encoded initial prompt.
 - `response_ids`: generated tokens plus inter-turn continuation tokens.
-- `response_mask`: `1` for model-generated tokens belonging to this chain and `0` for Tool results or other continuation context.
+- `response_mask`: `1` for model-generated tokens and `0` for Tool results or other continuation context.
 - Optional rollout log probabilities.
 - Session and materialization metadata. The Agent Framework attaches reward
   annotations only after the managed Runner returns.
@@ -306,9 +306,11 @@ by default and can be disabled with
 
 ## Multiple Turns and Trees
 
-`GatewaySession` delegates trajectory management to `ChainTrajectoryManager` by
-default. Enable `TreeTrajectoryManager` to store shared message prefixes as a
-tree instead of maintaining separate chain buffers:
+`GatewaySession` directly manages Chain trajectories by default. The Gateway
+Actor selects `TreeGatewaySession` when `use_tree_trajectory_manager` is `true`
+(default: `false`). `TreeGatewaySession` and its `TreeTrajectoryManager` are
+defined together in `uni_agent/gateway/session/tree_session.py` and store shared
+message prefixes as a tree instead of maintaining separate chain buffers:
 
 ```yaml
 actor_rollout_ref:
@@ -335,16 +337,17 @@ continued or rewritten in place. Their history remains available as a shared
 prefix for new chains.
 
 At finalization, each committed chain tip is expanded into the same `Trajectory`
-record type used by Chain mode, in latest-commit order. Each chain trains only
-its own generated tokens. Shared history from another chain becomes part of the
-initial prompt; subsequent continuation context receives mask `0`. Training
+record type used by Chain mode, ordered by its latest commit or capacity
+materialization. Each chain trains only its own generated tokens. Shared history
+from another chain becomes part of the initial prompt; subsequent continuation
+context receives mask `0`. Training
 ownership is fixed by chain ID and does not change when trajectories are filtered
 or reordered.
 The Framework then applies its existing trajectory selection, postprocessing,
 reward scoring, and TransferQueue flow.
 
-When `log_dir` is configured, finalization writes `trajectory_tree.pkl` in the
-session log directory before releasing the in-memory tree. Abort attempts to
+When `log_dir` is configured, finalization attempts to write `trajectory_tree.pkl`
+in the session log directory before releasing the in-memory tree. Abort attempts to
 write `trajectory_tree_abort.pkl`. These are end-of-session diagnostic snapshots,
 not per-turn checkpoints; without `log_dir`, no tree pickle is written.
 Snapshots store child links in a flat `node_children` table, without parent
@@ -471,8 +474,6 @@ actor_rollout_ref.rollout.custom.agent_framework
 Important knobs include:
 
 - `gateway_count`: Gateway actor pool size.
-- `use_tree_trajectory_manager`: uses shared-prefix Tree management instead of
-  Chain management. Defaults to `false`.
 - `mask_unfinished_episode`: zeroes training masks for sessions that report
   `finished=False`. Sessions without completion metadata remain trainable.
   Defaults to `false`.
