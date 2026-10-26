@@ -308,9 +308,9 @@ by default and can be disabled with
 
 `GatewaySession` directly manages Chain trajectories by default. The Gateway
 Actor selects `TreeGatewaySession` when `use_tree_trajectory_manager` is `true`
-(default: `false`). `TreeGatewaySession` and its `TreeTrajectoryManager` are
-defined together in `uni_agent/gateway/session/tree_session.py` and store shared
-message prefixes as a tree instead of maintaining separate chain buffers:
+(default: `false`). `TreeGatewaySession`, defined in
+`uni_agent/gateway/session/tree_session.py`, directly manages shared message
+prefixes as a tree instead of maintaining separate chain buffers:
 
 ```yaml
 actor_rollout_ref:

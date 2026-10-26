@@ -11,12 +11,12 @@ import pickle
 from dataclasses import dataclass, field, replace
 from itertools import repeat
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any
 
 from fastapi import HTTPException
 
 from uni_agent.gateway.session.codec import MessageCodec
-from uni_agent.gateway.session.session import GatewaySession, GenerationOutcome, SessionPhase
+from uni_agent.gateway.session.session import GatewaySession, GenerationOutcome, InflightRequest, SessionPhase
 from uni_agent.gateway.session.types import (
     AgentContext,
     InternalGenerationRequest,
@@ -75,15 +75,6 @@ class MessageNode:
         return self.parent is None and self.node_id == 0
 
 
-@dataclass
-class InflightRequest:
-    """Owner result and waiters to attribute when its generation commits."""
-
-    future: asyncio.Future[tuple[bool, Any]]
-    waiter_count: int = 0
-    owner: InflightRequest | None = None
-
-
 @dataclass(frozen=True, slots=True)
 class _MountedGeneration:
     """Request-local tree state kept while its backend generation is running."""
@@ -93,7 +84,6 @@ class _MountedGeneration:
     video_data: list[Any] | None
     target_node: MessageNode
     merge_backup: MessageNode | None
-    rewrite_action: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,47 +95,216 @@ class _TreeActiveChainView:
     active_tool_schemas: list[dict[str, Any]] | None
 
 
-class TreeTrajectoryManager:
-    """Own, synchronize, and optionally persist one session trajectory tree."""
+class TreeGatewaySession(GatewaySession):
+    """Own, synchronize, and optionally persist a shared-prefix trajectory tree."""
 
     def __init__(
         self,
+        handle: SessionHandle,
+        codec: MessageCodec,
+        *,
+        prompt_length: int | None = None,
+        response_length: int | None = None,
+        sampling_params: dict[str, Any] | None = None,
         enable_last_assistant_rollback: bool = True,
-        session_id: str | None = None,
-        mm_processor_kwargs: dict[str, Any] | None = None,
-        log_dir: str | Path | None = None,
         coalesce_reserved_exact_requests: bool = True,
+        metadata: dict[str, Any] | None = None,
     ) -> None:
+        super().__init__(
+            handle=handle,
+            codec=codec,
+            prompt_length=prompt_length,
+            response_length=response_length,
+            sampling_params=sampling_params,
+            enable_last_assistant_rollback=enable_last_assistant_rollback,
+            coalesce_reserved_exact_requests=coalesce_reserved_exact_requests,
+            metadata=metadata,
+        )
         if type(coalesce_reserved_exact_requests) is not bool:
             raise ValueError("coalesce_reserved_exact_requests must be a bool")
         if type(enable_last_assistant_rollback) is not bool:
             raise ValueError("enable_last_assistant_rollback must be a bool")
-        self.root = MessageNode(node_id=0, status="COMPLETED")
+        self.root: MessageNode | None = MessageNode(node_id=0, status="COMPLETED")
         self.tool_schemas_by_fingerprint: dict[str, list[dict[str, Any]] | None] = {}
-        # A node is active; a Trajectory is closed. Both retain commit order.
-        self.chains: dict[int, MessageNode | Trajectory] = {}
+        # Committed chain tips or closed trajectories, ordered by latest commit/materialization.
+        self.leaves: dict[int, MessageNode | Trajectory] = {}
         self._routed_experts_by_chain: dict[int, Any] = {}
         self._num_trajectories = 0
-        self.enable_last_assistant_rollback = enable_last_assistant_rollback
-        self._coalesce_reserved_exact_requests = coalesce_reserved_exact_requests
-        self._inflight_exact_requests: dict[str, InflightRequest] = {}
-        self._coalesced_request_count = 0
-        self._session_id = session_id
         self._next_node_id = 1
-        self._next_chain_id = 1
-        self.rewrite_merge_count = 0
-        self.rewrite_fork_count = 0
-        self.rewrite_dropped_trainable_tokens = 0
-        self._pending_requests: dict[int, tuple[dict[str, Any], int | None, InflightRequest]] = {}
         self._tree_lock = asyncio.Lock()
-        self._mm_processor_kwargs = dict(mm_processor_kwargs or {})
+        self._mm_processor_kwargs = dict(codec.mm_processor_kwargs or {})
+        log_dir = self._metadata.get("_log_dir")
         self._storage_path = Path(log_dir) / "trajectory_tree.pkl" if log_dir else None
+
+    async def run_generation(self, request: InternalGenerationRequest, backend) -> GenerationOutcome:
+        """Coalesce identical requests and overlap backend calls within the session."""
+        agent_context = request.get("agent_context")
+        request = {
+            **request,
+            "agent_context": agent_context.copy() if agent_context is not None else None,
+            "sampling_params": dict(request["sampling_params"]),
+        }
+        generation_span = start_generation_span(self._trace_identity)
+        owner_request: InflightRequest | None = None
+        request_fingerprint: str | None = None
+        try:
+            async with self.request_lock:
+                self._require_active()
+            request_fingerprint = (
+                self._compute_request_fingerprint(request) if self._coalesce_reserved_exact_requests else None
+            )
+            # Register ownership before the first tree-lock await, including new chains.
+            joined_request = (
+                self._inflight_exact_requests.get(request_fingerprint) if request_fingerprint is not None else None
+            )
+            if joined_request is not None:
+                self._record_coalesced_request(joined_request, request_fingerprint)
+                succeeded, result, _, _ = await asyncio.shield(joined_request.future)
+                if not succeeded:
+                    raise result
+            else:
+                owner_request = InflightRequest(asyncio.get_running_loop().create_future())
+                if request_fingerprint is not None:
+                    self._inflight_exact_requests[request_fingerprint] = owner_request
+                result = await self._run_generation(request, backend, owner_request)
+                if request_fingerprint is not None:
+                    self._resolve_inflight_exact_request(
+                        request_fingerprint, owner_request, (True, result, result[4], result[5])
+                    )
+            assistant_msg, finish_reason, prompt_tokens, completion_tokens, chain_id, turn, capacity_exhausted = result
+            self._touch()
+            if capacity_exhausted:
+                generation_span.capacity_exhausted(prompt_tokens=prompt_tokens, chain_id=chain_id)
+            else:
+                generation_span.success(
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    chain_id=chain_id,
+                    turn=turn,
+                    assistant_msg=assistant_msg,
+                    finish_reason=finish_reason,
+                )
+            return GenerationOutcome(
+                assistant_msg=assistant_msg,
+                finish_reason=finish_reason,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+            )
+        except BaseException as exc:
+            if owner_request is not None and request_fingerprint is not None:
+                self._resolve_inflight_exact_request(request_fingerprint, owner_request, (False, exc, None, None))
+            generation_span.failure(exc)
+            raise
+        finally:
+            generation_span.report()
+
+    async def finalize(self) -> list[Trajectory]:
+        async with self.request_lock:
+            if self.phase == SessionPhase.ABORTED:
+                raise RuntimeError(f"Session {self.handle.session_id} is aborted")
+            if self.phase == SessionPhase.FINALIZED:
+                raise RuntimeError(f"Session {self.handle.session_id} is finalized")
+            async with self._tree_lock:
+                trajectories = [
+                    leaf if isinstance(leaf, Trajectory) else self._linearize_path(self._path_from_root(leaf))
+                    for leaf in self.leaves.values()
+                ]
+                if self._storage_path is not None:
+                    try:
+                        await self._write_storage_state_locked(self._storage_path)
+                    except Exception:
+                        logger.warning(
+                            "Failed to persist trajectory tree %s",
+                            self._storage_path,
+                            exc_info=True,
+                        )
+                self._num_trajectories = len(trajectories)
+                self._clear_tree()
+                self.phase = SessionPhase.FINALIZED
+            if self._coalesced_request_count or self._rollback_count:
+                logger.info(
+                    "Session finalized with session=%s trajectories=%s num_coalesced_requests=%s "
+                    "rollback_count=%s rollback_dropped_trainable_tokens_total=%s",
+                    self.handle.session_id,
+                    len(trajectories),
+                    self._coalesced_request_count,
+                    self._rollback_count,
+                    self._rollback_dropped_trainable_tokens_total,
+                )
+            self._touch()
+            return trajectories
+
+    async def abort(self) -> None:
+        async with self.request_lock:
+            if self.phase == SessionPhase.ABORTED:
+                return
+            if self.phase == SessionPhase.FINALIZED:
+                raise RuntimeError(f"Session {self.handle.session_id} is finalized")
+            async with self._tree_lock:
+                storage_path = self._storage_path
+                try:
+                    if storage_path is not None and self.root is not None:
+                        storage_path = storage_path.with_name("trajectory_tree_abort.pkl")
+                        await self._write_storage_state_locked(storage_path)
+                        self._storage_path = storage_path
+                except Exception:
+                    logger.warning(
+                        "Failed to persist aborted trajectory tree %s",
+                        storage_path,
+                        exc_info=True,
+                    )
+                self._num_trajectories = 0
+                self._clear_tree()
+                self.phase = SessionPhase.ABORTED
+            self._touch()
+
+    def snapshot_state(self) -> dict[str, Any]:
+        """Read in-memory metadata without waiting for locks or performing I/O."""
+        chain_ids = sorted(chain_id for chain_id, leaf in self.leaves.items() if isinstance(leaf, MessageNode))
+        return {
+            "session_id": self.handle.session_id,
+            "phase": self.phase.value,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "num_trajectories": self._num_trajectories
+            + sum(isinstance(leaf, Trajectory) for leaf in self.leaves.values()),
+            "has_active_trajectory": bool(chain_ids),
+            "num_active_chains": len(chain_ids),
+            "active_chain_ids": chain_ids,
+            "rollback_count": self._rollback_count,
+            "rollback_dropped_trainable_tokens_total": self._rollback_dropped_trainable_tokens_total,
+            "num_coalesced_requests": self._coalesced_request_count,
+            # Cumulative node IDs allocated, including failed or removed branches.
+            "num_nodes": self._next_node_id - 1,
+        }
+
+    @property
+    def active_chains(self) -> list[_TreeActiveChainView]:
+        """Expose committed tree tips through the linear session's read-only view."""
+        return [
+            _TreeActiveChainView(
+                chain_id=chain_id,
+                message_history=self._path_messages(self._path_from_root(leaf)),
+                active_tool_schemas=self._copy_tools(self.tool_schemas_by_fingerprint.get(leaf.tools_fingerprint)),
+            )
+            for chain_id, leaf in sorted(self.leaves.items())
+            if isinstance(leaf, MessageNode)
+        ]
+
+    @active_chains.setter
+    def active_chains(self, value: list[Any]) -> None:
+        # Accept GatewaySession.__init__'s assignment; the tree owns the live view.
+        del value
+
+    @property
+    def storage_path(self) -> Path | None:
+        return self._storage_path
 
     def _storage_state(self) -> dict[str, Any]:
         # Keep topology flat: even a children-only tree can exceed pickle's recursion limit.
         nodes: dict[int, MessageNode] = {}
         stack = [self.root] if self.root is not None else []
-        stack.extend(leaf for leaf in self.chains.values() if isinstance(leaf, MessageNode))
+        stack.extend(leaf for leaf in self.leaves.values() if isinstance(leaf, MessageNode))
         while stack:
             node = stack.pop()
             if id(node) in nodes:
@@ -161,12 +320,11 @@ class TreeTrajectoryManager:
             "tool_schemas_by_fingerprint": self.tool_schemas_by_fingerprint,
             "chains": {
                 chain_id: copies[id(leaf)] if isinstance(leaf, MessageNode) else leaf
-                for chain_id, leaf in self.chains.items()
+                for chain_id, leaf in self.leaves.items()
             },
             "routed_experts_by_chain": self._routed_experts_by_chain,
-            "rewrite_merge_count": self.rewrite_merge_count,
-            "rewrite_fork_count": self.rewrite_fork_count,
-            "rewrite_dropped_trainable_tokens": self.rewrite_dropped_trainable_tokens,
+            "rewrite_merge_count": self._rollback_count,
+            "rewrite_dropped_trainable_tokens": self._rollback_dropped_trainable_tokens_total,
             "coalesced_request_count": self._coalesced_request_count,
         }
 
@@ -180,86 +338,7 @@ class TreeTrajectoryManager:
             os.fsync(output_file.fileno())
         os.replace(temporary_path, path)
 
-    @property
-    def storage_path(self) -> Path | None:
-        return self._storage_path
-
-    async def run_generation(
-        self,
-        messages: list[dict[str, Any]],
-        tools: list[dict[str, Any]] | None,
-        codec: MessageCodec,
-        trajectory_capacity: int | None,
-        sampling_params: dict[str, Any],
-        generate_fn: Callable[[list[int], dict[str, Any], list[Any] | None, list[Any] | None], Awaitable[Any]],
-        agent_context: AgentContext | None = None,
-    ) -> tuple[dict[str, Any], str, int, int, int | None, int, bool]:
-        """Share the outcome of identical requests while generation is pending."""
-        agent_context = agent_context.copy() if agent_context is not None else None
-        request_fingerprint = (
-            hashlib.sha256(
-                b"uni-agent-request-v1\0"
-                + json.dumps(
-                    {
-                        "agent_context": agent_context,
-                        "messages": messages,
-                        "tools": tools,
-                        "sampling_params": sampling_params,
-                        "trajectory_capacity": trajectory_capacity,
-                    },
-                    sort_keys=True,
-                    separators=(",", ":"),
-                    ensure_ascii=False,
-                ).encode("utf-8")
-            ).hexdigest()
-            if self._coalesce_reserved_exact_requests
-            else None
-        )
-        # No await between lookup and registration: identical requests share
-        # ownership before node mounting acquires the tree lock.
-        if request_fingerprint is not None:
-            joined_request = self._inflight_exact_requests.get(request_fingerprint)
-            if joined_request is not None:
-                owner = joined_request
-                while owner.owner is not None:
-                    owner = owner.owner
-                if not owner.future.done():
-                    self._record_coalesced_request(joined_request, request_fingerprint)
-                    succeeded, value = await asyncio.shield(joined_request.future)
-                    if not succeeded:
-                        raise value
-                    return value
-        owner_request = InflightRequest(asyncio.get_running_loop().create_future())
-        if request_fingerprint is not None:
-            self._inflight_exact_requests[request_fingerprint] = owner_request
-        try:
-            result = await self._run_generation(
-                messages=messages,
-                tools=tools,
-                codec=codec,
-                trajectory_capacity=trajectory_capacity,
-                sampling_params=sampling_params,
-                generate_fn=generate_fn,
-                owner_request=owner_request,
-                request_fingerprint=request_fingerprint,
-                agent_context=agent_context,
-            )
-        except BaseException as error:
-            owner_request.future.set_result((False, error))
-            raise
-        else:
-            owner_request.future.set_result((True, result))
-            return result
-        finally:
-            if (
-                request_fingerprint is not None
-                and self._inflight_exact_requests.get(request_fingerprint) is owner_request
-            ):
-                self._inflight_exact_requests.pop(request_fingerprint)
-
     def _record_coalesced_request(self, joined_request: InflightRequest, request_fingerprint: str) -> None:
-        while joined_request.owner is not None:
-            joined_request = joined_request.owner
         joined_request.waiter_count += 1
         self._coalesced_request_count += 1
         if self._coalesced_request_count == 1:
@@ -268,81 +347,75 @@ class TreeTrajectoryManager:
                 "The waiter shares the owner's backend generation and trajectory result. "
                 "Set coalesce_reserved_exact_requests=false to preserve independent "
                 "same-session sampling.",
-                self._session_id,
+                self.handle.session_id,
                 request_fingerprint[:12],
             )
 
     async def _run_generation(
         self,
-        messages: list[dict[str, Any]],
-        tools: list[dict[str, Any]] | None,
-        codec: MessageCodec,
-        trajectory_capacity: int | None,
-        sampling_params: dict[str, Any],
-        generate_fn: Callable[[list[int], dict[str, Any], list[Any] | None, list[Any] | None], Awaitable[Any]],
+        request: InternalGenerationRequest,
+        backend,
         owner_request: InflightRequest,
-        request_fingerprint: str | None,
-        agent_context: AgentContext | None = None,
     ) -> tuple[dict[str, Any], str, int, int, int | None, int, bool]:
         """Run one concurrent tree transaction around an unlocked backend call."""
+        messages, tools = request["messages"], request["tools"]
+        agent_context = request.get("agent_context")
         async with self._tree_lock:
-            if self.root is None:
-                raise RuntimeError("generation branch was removed before Backend completion")
+            self._require_active()
             mounted = await self._mount_generation(
                 messages=messages,
                 tools=tools,
-                codec=codec,
-                trajectory_capacity=trajectory_capacity,
-                sampling_params=sampling_params,
-                owner_request=owner_request,
                 agent_context=agent_context,
             )
-            if isinstance(mounted, InflightRequest):
-                owner_request.owner = mounted
-                mounted.waiter_count += owner_request.waiter_count
-                owner_request.waiter_count = 0
-                assert request_fingerprint is not None
-                self._record_coalesced_request(mounted, request_fingerprint)
-            else:
-                node = mounted.target_node
-                prompt_tokens = len(mounted.context_ids)
-                remaining_capacity = trajectory_capacity - prompt_tokens if trajectory_capacity is not None else None
-                if remaining_capacity is not None and remaining_capacity <= 0:
-                    try:
-                        prompt_tokens = self._close_length_exhausted_chain(mounted, codec)
-                    finally:
-                        self._rollback_mounted_branch(target_node=node, merge_backup=mounted.merge_backup)
-                    logger.warning(
-                        "Trajectory capacity prevents generation: session=%s. %s",
-                        self._session_id,
-                        _TRAJECTORY_CAPACITY_HINT,
-                    )
-                    return (
-                        {"role": "assistant", "content": ""},
-                        "length",
-                        prompt_tokens,
-                        0,
-                        node.chain_id or None,
-                        0,
-                        True,
-                    )
+            node = mounted.target_node
+            prompt_tokens = len(mounted.context_ids)
+            remaining_capacity = (
+                self._trajectory_capacity - prompt_tokens if self._trajectory_capacity is not None else None
+            )
+            if remaining_capacity is not None and remaining_capacity <= 0:
+                try:
+                    prompt_tokens = self._close_length_exhausted_chain(mounted)
+                finally:
+                    self._rollback_mounted_branch(target_node=node, merge_backup=mounted.merge_backup)
+                logger.warning(
+                    "Trajectory capacity prevents generation: session=%s. %s",
+                    self.handle.session_id,
+                    _TRAJECTORY_CAPACITY_HINT,
+                )
+                return (
+                    {"role": "assistant", "content": ""},
+                    "length",
+                    prompt_tokens,
+                    0,
+                    node.chain_id or None,
+                    0,
+                    True,
+                )
 
-                effective_sampling_params = dict(sampling_params)
-                if remaining_capacity is not None:
-                    effective_sampling_params["max_tokens"] = min(
-                        effective_sampling_params.get("max_tokens", remaining_capacity), remaining_capacity
-                    )
-
-        if isinstance(mounted, InflightRequest):
-            succeeded, value = await asyncio.shield(mounted.future)
-            if not succeeded:
-                raise value
-            return value
+            effective_sampling_params = dict(request["sampling_params"])
+            if remaining_capacity is not None:
+                effective_sampling_params["max_tokens"] = min(
+                    effective_sampling_params.get("max_tokens", remaining_capacity), remaining_capacity
+                )
 
         try:
-            output = await generate_fn(
-                mounted.context_ids, effective_sampling_params, mounted.image_data, mounted.video_data
-            )
+            try:
+                backend_kwargs = {}
+                if agent_context is not None and getattr(backend, "supports_agent_context", False) is True:
+                    backend_kwargs["agent_context"] = agent_context.copy()
+                output = await backend.generate(
+                    request_id=self.handle.session_id,
+                    prompt_ids=mounted.context_ids,
+                    sampling_params=effective_sampling_params,
+                    image_data=mounted.image_data,
+                    video_data=mounted.video_data,
+                    mm_processor_kwargs=self._codec.mm_processor_kwargs or {},
+                    **backend_kwargs,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            except Exception as exc:
+                raise HTTPException(status_code=500, detail=f"{exc.__class__.__name__}: {exc}") from exc
             response_ids = list(output.token_ids)
             response_logprobs: list[float] | None = None
             if effective_sampling_params.get("logprobs", False):
@@ -355,13 +428,12 @@ class TreeTrajectoryManager:
                         f"got {len(response_logprobs)} logprobs for {len(response_ids)} tokens"
                     )
             async with self._tree_lock:
-                if self.root is None:
-                    raise RuntimeError("generation branch was removed before Backend completion")
-                assistant_message, finish_reason = await codec.decode_response(
+                self._require_active()
+                assistant_message, finish_reason = await self._codec.decode_response(
                     response_ids, tools=tools, stop_reason=output.stop_reason
                 )
                 extra_fields = output.extra_fields or {}
-                merge_result = codec.merge_assistant_tokens(mounted.context_ids, response_ids)
+                merge_result = self._codec.merge_assistant_tokens(mounted.context_ids, response_ids)
                 if response_logprobs is not None and len(response_logprobs) != merge_result.appended_token_count:
                     raise ValueError(
                         "assistant_logprobs length must match appended assistant token count, "
@@ -385,8 +457,7 @@ class TreeTrajectoryManager:
                 node.max_global_steps = extra_fields.get("max_global_steps")
                 routed_experts = getattr(output, "routed_experts", None)
                 node.status = "COMPLETED"
-                self._pending_requests.pop(id(node), None)
-                previous_leaf = self.chains.get(node.chain_id)
+                previous_leaf = self.leaves.get(node.chain_id)
                 if previous_leaf is not None:
                     assert isinstance(previous_leaf, MessageNode), "Cannot commit to a closed chain"
                     node.num_coalesced_requests = previous_leaf.num_coalesced_requests
@@ -394,20 +465,18 @@ class TreeTrajectoryManager:
                     node.rollback_dropped_trainable_tokens_total = previous_leaf.rollback_dropped_trainable_tokens_total
                 node.num_coalesced_requests += owner_request.waiter_count
                 if mounted.merge_backup is not None:
-                    self.rewrite_merge_count += 1
-                    self.rewrite_dropped_trainable_tokens += len(mounted.merge_backup.response_ids)
+                    self._rollback_count += 1
+                    self._rollback_dropped_trainable_tokens_total += len(mounted.merge_backup.response_ids)
                     node.rollback_count += 1
                     node.rollback_dropped_trainable_tokens_total += len(mounted.merge_backup.response_ids)
                     mounted.merge_backup.image_data = mounted.merge_backup.video_data = None
-                elif mounted.rewrite_action == "fork":
-                    self.rewrite_fork_count += 1
                 if node.chain_id == 0:
                     node.chain_id = self._next_chain_id
                     self._next_chain_id += 1
                 chain_id = node.chain_id
                 # Registry order tracks the latest commit or capacity materialization.
-                self.chains.pop(chain_id, None)
-                self.chains[chain_id] = node
+                self.leaves.pop(chain_id, None)
+                self.leaves[chain_id] = node
                 if routed_experts is not None:
                     self._routed_experts_by_chain[chain_id] = routed_experts
         except BaseException as error:
@@ -426,7 +495,7 @@ class TreeTrajectoryManager:
         if finish_reason == "length" and remaining_capacity is not None and len(response_ids) >= remaining_capacity:
             logger.warning(
                 "Generation reached trajectory capacity: session=%s context_tokens=%s completion_tokens=%s. %s",
-                self._session_id,
+                self.handle.session_id,
                 prompt_tokens,
                 len(response_ids),
                 _TRAJECTORY_CAPACITY_HINT,
@@ -445,205 +514,154 @@ class TreeTrajectoryManager:
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None,
-        codec: MessageCodec,
-        owner_request: InflightRequest,
-        trajectory_capacity: int | None = None,
-        sampling_params: dict[str, Any] | None = None,
         agent_context: AgentContext | None = None,
-    ) -> _MountedGeneration | InflightRequest:
+    ) -> _MountedGeneration:
         """Match only stable nodes and mount one request-local PENDING branch."""
         merge_candidate: MessageNode | None = None
-        rewrite_action: str | None = None
-        target_node: MessageNode | None = None
-        try:
-            serialized_tools = json.dumps(tools, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
-            tools_fingerprint = hashlib.sha256(serialized_tools.encode("utf-8")).hexdigest()
-            if tools_fingerprint not in self.tool_schemas_by_fingerprint:
-                self.tool_schemas_by_fingerprint[tools_fingerprint] = self._copy_tools(tools)
+        serialized_tools = json.dumps(tools, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+        tools_fingerprint = hashlib.sha256(serialized_tools.encode("utf-8")).hexdigest()
+        if tools_fingerprint not in self.tool_schemas_by_fingerprint:
+            self.tool_schemas_by_fingerprint[tools_fingerprint] = self._copy_tools(tools)
 
-            parent = self.root
-            parent_path: list[MessageNode] = []
-            offset = 0
-            assistant_candidate: MessageNode | None = None
-            active_path_ranks: dict[int, tuple[int, bool]] = {}
-            for leaf in self.chains.values():
-                if not isinstance(leaf, MessageNode):
+        parent = self.root
+        parent_path: list[MessageNode] = []
+        offset = 0
+        assistant_candidate: MessageNode | None = None
+        active_path_ranks: dict[int, tuple[int, bool, int]] = {}
+        for commit_order, leaf in enumerate(self.leaves.values()):
+            if not isinstance(leaf, MessageNode):
+                continue
+            if leaf.agent_context != agent_context or leaf.tools_fingerprint != tools_fingerprint:
+                continue
+            path = self._path_from_root(leaf)
+            history = self._path_messages(path)
+            prefix_length = len(history) - 1
+            if len(messages) <= prefix_length or not self._messages_equal(history[:-1], messages[:prefix_length]):
+                continue
+            exact = self._messages_equal(history[-1:], messages[prefix_length : prefix_length + 1])
+            rank = (len(history) if exact else prefix_length, exact, commit_order)
+            for node in path:
+                active_path_ranks[id(node)] = max(active_path_ranks.get(id(node), (0, False, -1)), rank)
+        while offset < len(messages) and messages[-1].get("role") != "assistant":
+            incoming = messages[offset:]
+            matching_full: list[MessageNode] = []
+            candidate: MessageNode | None = None
+            for child in parent.children:
+                if child.agent_context != agent_context:
                     continue
-                if leaf.agent_context != agent_context or leaf.tools_fingerprint != tools_fingerprint:
+                if child.tools_fingerprint != tools_fingerprint:
                     continue
-                path = self._path_from_root(leaf)
-                history = self._path_messages(path)
-                prefix_length = len(history) - 1
-                if len(messages) <= prefix_length or not self._messages_equal(
-                    history[:-1], messages[:prefix_length], codec
+                if child.status != "COMPLETED" or not child.messages:
+                    continue
+                prefix_length = len(child.messages) - 1
+                if len(incoming) < prefix_length or not self._messages_equal(
+                    child.messages[:-1], incoming[:prefix_length]
                 ):
                     continue
-                exact = self._messages_equal(history, messages[: len(history)], codec)
-                rank = (len(history) if exact else prefix_length, exact)
-                for node in path:
-                    active_path_ranks[id(node)] = max(active_path_ranks.get(id(node), (0, False)), rank)
-            while offset < len(messages) and messages[-1].get("role") != "assistant":
-                incoming = messages[offset:]
-                matching_full: list[MessageNode] = []
-                candidate: MessageNode | None = None
-                for child in parent.children:
-                    if child.agent_context != agent_context:
-                        continue
-                    if child.tools_fingerprint != tools_fingerprint:
-                        continue
-                    if child.status == "PENDING":
-                        pending = self._pending_requests.get(id(child))
-                        if (
-                            self._coalesce_reserved_exact_requests
-                            and pending is not None
-                            and pending[0] == sampling_params
-                            and pending[1] == trajectory_capacity
-                            and self._messages_equal(child.messages, incoming, codec)
-                        ):
-                            return pending[2]
-                        continue
-                    if child.status != "COMPLETED" or not child.messages:
-                        continue
-                    prefix_length = len(child.messages) - 1
-                    if len(incoming) < prefix_length or not self._messages_equal(
-                        child.messages[:-1], incoming[:prefix_length], codec
-                    ):
-                        continue
-                    if len(incoming) == prefix_length and child.messages[-1].get("role") == "assistant":
-                        continue  # Same prompt after completion starts an independent sample.
-                    if len(incoming) > prefix_length and self._messages_equal(
-                        [child.messages[-1]], [incoming[prefix_length]], codec
-                    ):
-                        matching_full.append(child)
-                        continue
-                    if child.messages[-1].get("role") == "assistant" and (
-                        candidate is None or self.chains.get(child.chain_id) is child
-                    ):
-                        candidate = child
-                if matching_full:
-                    # Prefer the best matching active history, including its shared ancestors.
-                    child = max(matching_full, key=lambda node: active_path_ranks.get(id(node), (0, False)))
-                    parent = child
-                    parent_path.append(child)
-                    offset += len(child.messages)
+                if len(incoming) == prefix_length and child.messages[-1].get("role") == "assistant":
+                    continue  # Same prompt after completion starts an independent sample.
+                if len(incoming) > prefix_length and self._messages_equal(
+                    [child.messages[-1]], [incoming[prefix_length]]
+                ):
+                    matching_full.append(child)
                     continue
-                assistant_candidate = candidate
-                break
+                if child.messages[-1].get("role") == "assistant" and (
+                    candidate is None or self.leaves.get(child.chain_id) is child
+                ):
+                    candidate = child
+            if matching_full:
+                # Prefer the best matching active history, then its latest commit, including shared ancestors.
+                child = max(matching_full, key=lambda node: active_path_ranks.get(id(node), (0, False, -1)))
+                parent = child
+                parent_path.append(child)
+                offset += len(child.messages)
+                continue
+            assistant_candidate = candidate
+            break
 
-            pending_messages = messages[offset:]
-            if assistant_candidate is not None:
-                parent = assistant_candidate.parent
-                sibling_assistant_nodes = [
-                    child
-                    for child in parent.children
-                    if child.status == "COMPLETED"
-                    and self.chains.get(child.chain_id) is child
-                    and child.agent_context == agent_context
-                    and child.tools_fingerprint == tools_fingerprint
-                    and child.messages
-                    and child.messages[-1].get("role") == "assistant"
-                    and len(child.messages) == len(assistant_candidate.messages)
-                    and self._messages_equal(child.messages[:-1], assistant_candidate.messages[:-1], codec)
-                ]
-                merge = (
-                    self.enable_last_assistant_rollback
-                    and self.chains.get(assistant_candidate.chain_id) is assistant_candidate
-                    and len(sibling_assistant_nodes) == 1
-                    and not assistant_candidate.children
-                    and not any(
-                        child.status == "PENDING" and child.agent_context == agent_context for child in parent.children
-                    )
-                )
-                rewrite_action = "merge" if merge else "fork"
-                if merge:
-                    merge_candidate = assistant_candidate
-
-            context_ids: list[int] = []
-            for node in parent_path:
-                if node.removed_prefix_token_count:
-                    del context_ids[-node.removed_prefix_token_count :]
-                context_ids.extend(node.prompt_ids)
-                context_ids.extend(node.response_ids)
-            merge_result = None
-            new_image_data = new_video_data = None
-            image_data = [image for node in parent_path for image in node.image_data or []] or None
-            video_data = [video for node in parent_path for video in node.video_data or []] or None
-            if not pending_messages and not parent.is_root:
-                prompt_ids = []
-            else:
-                if not parent.is_root:
-                    codec.validate_incremental_media(pending_messages)
-                new_image_data, new_video_data = await codec.extract_multi_modal_data(pending_messages)
-                if not parent.is_root and new_video_data:
-                    raise UnsupportedMediaError(
-                        "Continuous Token context merging does not currently support incremental video data"
-                    )
-                if new_image_data:
-                    image_data = [*(image_data or []), *new_image_data]
-                if new_video_data:
-                    video_data = [*(video_data or []), *new_video_data]
-                if parent.is_root:
-                    prompt_ids = codec.build_initial_tokens(
-                        pending_messages, tools=tools, image_data=image_data, video_data=video_data
-                    )
-                    context_ids = prompt_ids
-                else:
-                    previous_messages = self._path_messages(parent_path)
-                    merge_result = codec.merge_context_tokens(
-                        previous_messages,
-                        previous_messages + pending_messages,
-                        context_ids,
-                        tools=tools,
-                        image_data=image_data,
-                    )
-                    prompt_ids = merge_result.token_ids[len(context_ids) - merge_result.removed_prefix_token_count :]
-                    context_ids = merge_result.token_ids
-            chain_id = 0
-            if rewrite_action == "merge":
-                chain_id = merge_candidate.chain_id
-            elif (
-                not parent.is_root
-                and parent.chain_id in self.chains
-                and self.chains[parent.chain_id] is parent
-                and not parent.children
-            ):
-                chain_id = parent.chain_id
+        pending_messages = messages[offset:]
+        if assistant_candidate is not None:
+            sibling_assistant_nodes = [
+                child
+                for child in parent.children
+                if child.status == "COMPLETED"
+                and self.leaves.get(child.chain_id) is child
+                and child.agent_context == agent_context
+                and child.tools_fingerprint == tools_fingerprint
+                and child.messages
+                and child.messages[-1].get("role") == "assistant"
+                and len(child.messages) == len(assistant_candidate.messages)
+                and self._messages_equal(child.messages[:-1], assistant_candidate.messages[:-1])
+            ]
             if (
-                sampling_params.get("logprobs", False)
-                and (trajectory_capacity is None or len(context_ids) < trajectory_capacity)
-                and chain_id != 0
-                and parent_path
-                and (merge_candidate or parent).response_logprobs is None
-            ):
-                retained_response_tokens = 0
-                for index, node in enumerate(parent_path):
-                    if node.chain_id != chain_id:
-                        continue
-                    retained_response_tokens = max(0, retained_response_tokens - node.removed_prefix_token_count)
-                    if index and parent_path[index - 1].chain_id == chain_id:
-                        retained_response_tokens += len(node.prompt_ids)
-                    retained_response_tokens += len(node.response_ids)
-                trimmed_tokens = merge_result.removed_prefix_token_count if merge_result else 0
-                assert retained_response_tokens <= trimmed_tokens, (
-                    "response_logprobs must be empty or aligned with response_ids"
+                self._enable_last_assistant_rollback
+                and self.leaves.get(assistant_candidate.chain_id) is assistant_candidate
+                and len(sibling_assistant_nodes) == 1
+                and not assistant_candidate.children
+                and not any(
+                    child.status == "PENDING" and child.agent_context == agent_context for child in parent.children
                 )
-            node_id = merge_candidate.node_id if merge_candidate is not None else self._next_node_id
-            if merge_candidate is None:
-                self._next_node_id += 1
-            target_node = MessageNode(
-                node_id=node_id,
-                messages=pending_messages,
-                parent=parent,
-                prompt_ids=prompt_ids,
-                removed_prefix_token_count=merge_result.removed_prefix_token_count if merge_result else 0,
-                image_data=list(new_image_data) if new_image_data else None,
-                video_data=list(new_video_data) if new_video_data else None,
-                tools_fingerprint=tools_fingerprint,
-                agent_context=agent_context.copy() if agent_context is not None else None,
-                chain_id=chain_id,
+            ):
+                merge_candidate = assistant_candidate
+
+        context_ids: list[int] = []
+        for node in parent_path:
+            if node.removed_prefix_token_count:
+                del context_ids[-node.removed_prefix_token_count :]
+            context_ids.extend(node.prompt_ids)
+            context_ids.extend(node.response_ids)
+        merge_result = None
+        image_data = [image for node in parent_path for image in node.image_data or []] or None
+        video_data = [video for node in parent_path for video in node.video_data or []] or None
+        if not parent.is_root:
+            self._codec.validate_incremental_media(pending_messages)
+        new_image_data, new_video_data = await self._codec.extract_multi_modal_data(pending_messages)
+        if not parent.is_root and new_video_data:
+            raise UnsupportedMediaError(
+                "Continuous Token context merging does not currently support incremental video data"
             )
+        if new_image_data:
+            image_data = [*(image_data or []), *new_image_data]
+        if new_video_data:
+            video_data = [*(video_data or []), *new_video_data]
+        if parent.is_root:
+            prompt_ids = self._codec.build_initial_tokens(
+                pending_messages, tools=tools, image_data=image_data, video_data=video_data
+            )
+            context_ids = prompt_ids
+        else:
+            previous_messages = self._path_messages(parent_path)
+            merge_result = self._codec.merge_context_tokens(
+                previous_messages,
+                previous_messages + pending_messages,
+                context_ids,
+                tools=tools,
+                image_data=image_data,
+            )
+            prompt_ids = merge_result.token_ids[len(context_ids) - merge_result.removed_prefix_token_count :]
+            context_ids = merge_result.token_ids
+        chain_id = 0
+        if merge_candidate is not None:
+            chain_id = merge_candidate.chain_id
+        elif not parent.is_root and self.leaves.get(parent.chain_id) is parent and not parent.children:
+            chain_id = parent.chain_id
+        node_id = merge_candidate.node_id if merge_candidate is not None else self._next_node_id
+        if merge_candidate is None:
+            self._next_node_id += 1
+        target_node = MessageNode(
+            node_id=node_id,
+            messages=pending_messages,
+            parent=parent,
+            prompt_ids=prompt_ids,
+            removed_prefix_token_count=merge_result.removed_prefix_token_count if merge_result else 0,
+            image_data=list(new_image_data) if new_image_data else None,
+            video_data=list(new_video_data) if new_video_data else None,
+            tools_fingerprint=tools_fingerprint,
+            agent_context=agent_context.copy() if agent_context is not None else None,
+            chain_id=chain_id,
+        )
+        try:
             parent.children.append(target_node)
-            self._pending_requests[id(target_node)] = (dict(sampling_params or {}), trajectory_capacity, owner_request)
             if merge_candidate is not None:
                 parent.children.remove(merge_candidate)
         except BaseException:
@@ -655,7 +673,6 @@ class TreeTrajectoryManager:
             video_data=video_data,
             target_node=target_node,
             merge_backup=merge_candidate,
-            rewrite_action=rewrite_action,
         )
 
     def _rollback_mounted_branch(
@@ -664,7 +681,6 @@ class TreeTrajectoryManager:
         merge_backup: MessageNode | None,
     ) -> None:
         if target_node is not None:
-            self._pending_requests.pop(id(target_node), None)
             target_node.image_data = target_node.video_data = None
         if self.root is None:
             return
@@ -676,10 +692,10 @@ class TreeTrajectoryManager:
             if not any(child is merge_backup for child in parent.children):
                 parent.children.append(merge_backup)
 
-    def _close_length_exhausted_chain(self, mounted: _MountedGeneration, codec: MessageCodec) -> int:
+    def _close_length_exhausted_chain(self, mounted: _MountedGeneration) -> int:
         """Freeze the committed chain, applying an accepted rollback before closing."""
         chain_id = mounted.target_node.chain_id
-        leaf = self.chains.get(chain_id)
+        leaf = self.leaves.get(chain_id)
         if not isinstance(leaf, MessageNode):
             return len(mounted.context_ids)
         path = self._path_from_root(leaf)
@@ -710,7 +726,7 @@ class TreeTrajectoryManager:
             # Match Chain's pre-assistant response-length check, not sum(mask).
             drop_chain = not trajectory.response_ids
             stored_ids = trajectory.prompt_ids if drop_chain else trajectory.response_ids
-            assistant_prefix = codec.turn_separator + codec.generation_prompt
+            assistant_prefix = self._codec.turn_separator + self._codec.generation_prompt
             if assistant_prefix:
                 if stored_ids[-len(assistant_prefix) :] != assistant_prefix:
                     raise ValueError("Stored trajectory does not end with the assistant prefix")
@@ -722,91 +738,24 @@ class TreeTrajectoryManager:
             trajectory.response_logprobs = trajectory.response_logprobs or None
         trajectory.extra_fields["materialization_reason"] = "max_trajectory_length"
         # All conversion/validation precedes the state change; this runs under the tree lock.
-        self.chains.pop(chain_id)
+        self.leaves.pop(chain_id)
         if not drop_chain:
-            self.chains[chain_id] = trajectory
+            self.leaves[chain_id] = trajectory
         self._routed_experts_by_chain.pop(chain_id, None)
         if backup is not None:
-            self.rewrite_merge_count += 1
-            self.rewrite_dropped_trainable_tokens += len(backup.response_ids)
+            self._rollback_count += 1
+            self._rollback_dropped_trainable_tokens_total += len(backup.response_ids)
         return len(trajectory.prompt_ids) + len(trajectory.response_ids)
-
-    def snapshot_state(self) -> dict[str, Any]:
-        """Read in-memory metadata without waiting for locks or performing I/O."""
-        chain_ids = sorted(chain_id for chain_id, leaf in self.chains.items() if isinstance(leaf, MessageNode))
-        return {
-            "num_trajectories": self._num_trajectories
-            + sum(isinstance(leaf, Trajectory) for leaf in self.chains.values()),
-            "has_active_trajectory": bool(chain_ids),
-            "num_active_chains": len(chain_ids),
-            "active_chain_ids": chain_ids,
-            "rollback_count": self.rewrite_merge_count,
-            "rollback_dropped_trainable_tokens_total": self.rewrite_dropped_trainable_tokens,
-            "num_coalesced_requests": self._coalesced_request_count,
-            "rewrite_fork_count": self.rewrite_fork_count,
-            # Cumulative node IDs allocated, including failed or removed branches.
-            "num_nodes": self._next_node_id - 1,
-        }
-
-    async def finalize_trajectories(self) -> list[Trajectory]:
-        async with self._tree_lock:
-            if self.root is None:
-                raise RuntimeError("trajectory tree is finalized or aborted")
-            trajectories = [
-                leaf if isinstance(leaf, Trajectory) else self._linearize_path(self._path_from_root(leaf))
-                for leaf in self.chains.values()
-            ]
-            if self._storage_path is not None:
-                try:
-                    await self._write_storage_state_locked(self._storage_path)
-                except Exception:
-                    logger.warning(
-                        "Failed to persist trajectory tree %s",
-                        self._storage_path,
-                        exc_info=True,
-                    )
-            self._num_trajectories = len(trajectories)
-            self._clear_tree()
-            return trajectories
-
-    async def abort(self) -> None:
-        async with self._tree_lock:
-            storage_path = self._storage_path
-            try:
-                if storage_path is not None and self.root is not None:
-                    storage_path = storage_path.with_name("trajectory_tree_abort.pkl")
-                    await self._write_storage_state_locked(storage_path)
-                    self._storage_path = storage_path
-            except Exception:
-                logger.warning(
-                    "Failed to persist aborted trajectory tree %s",
-                    storage_path,
-                    exc_info=True,
-                )
-            self._num_trajectories = 0
-            self._clear_tree()
-
-    def get_active_chains(self) -> list[dict[str, Any]]:
-        return [
-            {
-                "chain_id": chain_id,
-                "message_history": self._path_messages(self._path_from_root(leaf)),
-                "active_tool_schemas": self._copy_tools(self.tool_schemas_by_fingerprint.get(leaf.tools_fingerprint)),
-            }
-            for chain_id, leaf in sorted(self.chains.items())
-            if isinstance(leaf, MessageNode)
-        ]
 
     def _clear_tree(self) -> None:
         """Release the in-memory tree and break MessageNode reference cycles."""
-        stack = [leaf for leaf in self.chains.values() if isinstance(leaf, MessageNode)]
+        stack = [leaf for leaf in self.leaves.values() if isinstance(leaf, MessageNode)]
         if self.root is not None:
             stack.append(self.root)
         self.root = None
-        self.chains.clear()
+        self.leaves.clear()
         self.tool_schemas_by_fingerprint.clear()
         self._routed_experts_by_chain.clear()
-        self._pending_requests.clear()
         while stack:
             node = stack.pop()
             stack.extend(node.children)
@@ -836,11 +785,10 @@ class TreeTrajectoryManager:
         self,
         left: list[dict[str, Any]],
         right: list[dict[str, Any]],
-        codec: MessageCodec,
     ) -> bool:
         return len(left) == len(right) and all(
-            codec.canonicalize_message_for_prefix_comparison(left_message)
-            == codec.canonicalize_message_for_prefix_comparison(right_message)
+            self._codec.canonicalize_message_for_prefix_comparison(left_message)
+            == self._codec.canonicalize_message_for_prefix_comparison(right_message)
             for left_message, right_message in zip(left, right, strict=True)
         )
 
@@ -934,180 +882,6 @@ class TreeTrajectoryManager:
 
     def _copy_tools(self, tools: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
         return [dict(tool) for tool in tools] if tools is not None else None
-
-
-class TreeGatewaySession(GatewaySession):
-    """Gateway session backed by the shared-prefix trajectory tree."""
-
-    def __init__(
-        self,
-        handle: SessionHandle,
-        codec: MessageCodec,
-        *,
-        prompt_length: int | None = None,
-        response_length: int | None = None,
-        sampling_params: dict[str, Any] | None = None,
-        enable_last_assistant_rollback: bool = True,
-        coalesce_reserved_exact_requests: bool = True,
-        metadata: dict[str, Any] | None = None,
-    ) -> None:
-        super().__init__(
-            handle=handle,
-            codec=codec,
-            prompt_length=prompt_length,
-            response_length=response_length,
-            sampling_params=sampling_params,
-            enable_last_assistant_rollback=enable_last_assistant_rollback,
-            coalesce_reserved_exact_requests=coalesce_reserved_exact_requests,
-            metadata=metadata,
-        )
-        self._manager = TreeTrajectoryManager(
-            coalesce_reserved_exact_requests=coalesce_reserved_exact_requests,
-            enable_last_assistant_rollback=enable_last_assistant_rollback,
-            session_id=handle.session_id,
-            log_dir=self._metadata.get("_log_dir"),
-            mm_processor_kwargs=codec.mm_processor_kwargs,
-        )
-
-    async def run_generation(self, request: InternalGenerationRequest, backend) -> GenerationOutcome:
-        """Run one generation while allowing backend overlap within the session."""
-        agent_context = request.get("agent_context")
-        agent_context = agent_context.copy() if agent_context is not None else None
-        generation_span = start_generation_span(self._trace_identity)
-        try:
-            async with self.request_lock:
-                self._require_active()
-
-            async def generate_fn(context_ids, sampling_params, image_data, video_data):
-                try:
-                    backend_kwargs = {}
-                    if agent_context is not None and getattr(backend, "supports_agent_context", False) is True:
-                        backend_kwargs["agent_context"] = agent_context.copy()
-                    return await backend.generate(
-                        request_id=self.handle.session_id,
-                        prompt_ids=context_ids,
-                        sampling_params=sampling_params,
-                        image_data=image_data,
-                        video_data=video_data,
-                        mm_processor_kwargs=self._codec.mm_processor_kwargs or {},
-                        **backend_kwargs,
-                    )
-                except ValueError as exc:
-                    raise HTTPException(status_code=400, detail=str(exc)) from exc
-                except Exception as exc:
-                    raise HTTPException(status_code=500, detail=f"{exc.__class__.__name__}: {exc}") from exc
-
-            try:
-                (
-                    assistant_msg,
-                    finish_reason,
-                    prompt_tokens,
-                    completion_tokens,
-                    chain_id,
-                    turn,
-                    capacity_exhausted,
-                ) = await self._manager.run_generation(
-                    messages=request["messages"],
-                    tools=request["tools"],
-                    codec=self._codec,
-                    trajectory_capacity=self._trajectory_capacity,
-                    sampling_params=dict(request["sampling_params"]),
-                    generate_fn=generate_fn,
-                    agent_context=agent_context,
-                )
-            except RuntimeError as exc:
-                async with self.request_lock:
-                    if self.phase != SessionPhase.ACTIVE and str(exc) in (
-                        "trajectory tree is finalized or aborted",
-                        "generation branch was removed before Backend completion",
-                    ):
-                        raise HTTPException(
-                            status_code=409,
-                            detail=f"Session {self.handle.session_id} is {self.phase.value.lower()}",
-                        ) from exc
-                raise
-            outcome = GenerationOutcome(
-                assistant_msg=assistant_msg,
-                finish_reason=finish_reason,
-                prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens,
-            )
-            self._touch()
-            if capacity_exhausted:
-                generation_span.capacity_exhausted(prompt_tokens=prompt_tokens, chain_id=chain_id)
-            else:
-                generation_span.success(
-                    prompt_tokens=prompt_tokens,
-                    completion_tokens=completion_tokens,
-                    chain_id=chain_id,
-                    turn=turn,
-                    assistant_msg=assistant_msg,
-                    finish_reason=finish_reason,
-                )
-            return outcome
-        except BaseException as exc:
-            generation_span.failure(exc)
-            raise
-        finally:
-            generation_span.report()
-
-    async def finalize(self) -> list[Trajectory]:
-        async with self.request_lock:
-            if self.phase == SessionPhase.ABORTED:
-                raise RuntimeError(f"Session {self.handle.session_id} is aborted")
-            if self.phase == SessionPhase.FINALIZED:
-                raise RuntimeError(f"Session {self.handle.session_id} is finalized")
-            trajectories = await self._manager.finalize_trajectories()
-            self.phase = SessionPhase.FINALIZED
-            manager_state = self._manager.snapshot_state()
-            if manager_state["num_coalesced_requests"] or manager_state["rollback_count"]:
-                logger.info(
-                    "Session finalized with session=%s trajectories=%s num_coalesced_requests=%s "
-                    "rollback_count=%s rollback_dropped_trainable_tokens_total=%s",
-                    self.handle.session_id,
-                    len(trajectories),
-                    manager_state["num_coalesced_requests"],
-                    manager_state["rollback_count"],
-                    manager_state["rollback_dropped_trainable_tokens_total"],
-                )
-            self._touch()
-            return trajectories
-
-    async def abort(self) -> None:
-        async with self.request_lock:
-            if self.phase == SessionPhase.ABORTED:
-                return
-            if self.phase == SessionPhase.FINALIZED:
-                raise RuntimeError(f"Session {self.handle.session_id} is finalized")
-            await self._manager.abort()
-            self.phase = SessionPhase.ABORTED
-            self._touch()
-
-    def snapshot_state(self) -> dict[str, Any]:
-        manager_state = self._manager.snapshot_state()
-        return {
-            "session_id": self.handle.session_id,
-            "phase": self.phase.value,
-            "created_at": self.created_at,
-            "updated_at": self.updated_at,
-            **manager_state,
-        }
-
-    def get_active_chains(self) -> list[dict[str, Any]]:
-        return self._manager.get_active_chains()
-
-    @property
-    def active_chains(self) -> list[_TreeActiveChainView]:
-        """Expose the tree leaves through the linear session's attribute API."""
-        if not hasattr(self, "_manager"):
-            return []
-        return [_TreeActiveChainView(**chain) for chain in self._manager.get_active_chains()]
-
-    @active_chains.setter
-    def active_chains(self, value: list[Any]) -> None:
-        # ``GatewaySession.__init__`` initializes the Chain attribute before
-        # the tree manager exists. The tree implementation owns the live view.
-        del value
 
     def _require_active(self) -> None:
         if self.phase != SessionPhase.ACTIVE:
